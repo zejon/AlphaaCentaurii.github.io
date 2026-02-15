@@ -1,78 +1,86 @@
+let currentStream = null;
+let currentFacingMode = 'user';
+
 window.onload = function() {
-  // Get the video element from the DOM
+  
   const video = document.getElementById('videoElement');
   const errorMessage = document.getElementById('errorMessage');
+  const flipBtn = document.getElementById('flipBtn'); 
 
-  // Checks if the browser supports getUserMedia
-  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-    // Define the constraints for the media stream, requesting video
-    const constraints = { video: true };
+  function initCamera(facingMode) {
+    if (currentStream) {
+      currentStream.getTracks().forEach(track => track.stop());
+    }
 
-    // Request access to the user's camera
-    navigator.mediaDevices.getUserMedia(constraints)
-      .then((stream) => {
-        // If works, the camera connects to the video element
-        video.srcObject = stream;
-        video.style.display = 'block'; // Ensure video is visible
-        errorMessage.style.display = 'none'; // Hide error message
-      })
-      .catch((err) => {
-        // if it does not work, hide the video element and display an error message
-        console.error('An error occurred: ' + err);
-        video.style.display = 'none'; 
-        errorMessage.style.display = 'block'; 
-        
-        // if error message will be displayed
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-          errorMessage.textContent = 'Camera access was denied. Please allow camera access in your browser settings to use this feature.';
-        } else if (err.name === 'NotFoundError') {
-          errorMessage.textContent = 'No camera found on this device.';
-        } else {
-          errorMessage.textContent = 'An error occurred while accessing the camera.';
-        }
-      });
-  } else {
-    // If getUserMedia is not supported, show this message
-    video.style.display = 'none';
-    errorMessage.style.display = 'block';
-    errorMessage.textContent = 'Your browser does not support camera access. Please try a different browser.';
+    const constraints = { video: { facingMode: facingMode } };
+
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices.getUserMedia(constraints)
+        .then((stream) => {
+          currentStream = stream;
+          video.srcObject = stream;
+          video.style.display = 'block';
+          errorMessage.style.display = 'none';
+        })
+        .catch((err) => {
+          console.error('An error occurred: ' + err);
+          video.style.display = 'none';
+          errorMessage.style.display = 'block';
+          
+          if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+            errorMessage.textContent = 'Camera access was denied.';
+          } else {
+            errorMessage.textContent = 'An error occurred while accessing the camera.';
+          }
+        });
+    }
   }
 
-let deferredPrompt;
+  // Start the camera
+  initCamera(currentFacingMode);
+
+  // Flip button listener
+  if (flipBtn) {
+    flipBtn.onclick = () => {
+      currentFacingMode = (currentFacingMode === 'user') ? 'environment' : 'user';
+      initCamera(currentFacingMode);
+    };
+  }
+
+
+
+  let deferredPrompt;
   const popup = document.getElementById('install-popup');
   const installBtn = document.getElementById('popup-install-btn');
   const closeBtn = document.getElementById('popup-close');
 
-  // Detect if the device is mobile
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
-  // it'll prompt install for the browser
   window.addEventListener('beforeinstallprompt', (e) => {
-      // Prevent the default mini-infobar from appearing
       e.preventDefault();
-      // Save the event so it can be triggered later
       deferredPrompt = e;
 
-      // Only show our popup install prompt if on mobile and not already installed
       if (isMobile && !localStorage.getItem('pwa_dismissed')) {
-          popup.style.display = 'flex';
+          if (popup) popup.style.display = 'flex';
       }
   });
 
-  //  Install the app when button clicked
-  installBtn.addEventListener('click', async () => {
-      if (deferredPrompt) {
-          deferredPrompt.prompt();
-          const { outcome } = await deferredPrompt.userChoice;
-          console.log(`User choice: ${outcome}`);
-          deferredPrompt = null;
-          banner.style.display = 'none';
-      }
-  });
+  if (installBtn) {
+    installBtn.addEventListener('click', async () => {
+        if (deferredPrompt) {
+            deferredPrompt.prompt();
+            const { outcome } = await deferredPrompt.userChoice;
+            console.log(`User choice: ${outcome}`);
+            deferredPrompt = null;
+            if (popup) popup.style.display = 'none'; 
+        }
+    });
+  }
 
-  // Closes the popup
-  closeBtn.addEventListener('click', () => {
-      banner.style.display = 'none';
-  });
-
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+        if (popup) popup.style.display = 'none';
+        localStorage.setItem('pwa_dismissed', 'true');
+    });
+  }
 };
