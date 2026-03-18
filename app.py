@@ -1,118 +1,388 @@
-import os
-# Optional: Suppress the oneDNN notification
+import os, base64, warnings, time
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import cv2
+import mediapipe as mp
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from collections import deque
+from pathlib import Path
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.core.base_options import BaseOptions
 
-from flask import Flask, render_template, request, jsonify, send_from_directory
-import os
-# import tensorflow as tf
-# from tensorflow.keras.models import load_model
-# import cv2
-# import numpy as np
-# from PIL import Image
-# import io
-# import tempfile
+# Import your NLP Engine
+from nlp_interference import glosstosentenceinference
 
+warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
-# # model = load_model('best_model.h5')
-# model = load_model('trial_model_01.keras')
+CORS(app)
 
-# CLASS_LABELS = {
-#     0: 'monday',
-#     1: 'tuesday',
-#     2: 'wednesday',
-#     3: 'thursday',
-#     4: 'friday',
-# }
+# ── 1. Configuration & Setup ──────────────────────────────────
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Device: {device}')
+
+CONFIG = {
+    'labels_csv': 'labels.csv',
+    'model_path': 'best_fsl_model_final_0004.pth',  # Match the new 0004 model
+    'num_frames': 48,
+    'feature_dim': 198,
+    'num_classes': 105,
+    'd_model': 384,
+    'nhead': 8,
+    'num_layers': 6,
+    'dim_ff': 768,
+    'dropout': 0.25, # Matched to 0004 specs
+    'top_k': 5,
+    'pose_model': 'models/pose_landmarker.task',
+    'hand_model': 'models/hand_landmarker.task',
+    'face_model': 'models/face_landmarker.task',
+    
+    # EXACT APP.PY TIMING
+    'record_secs': 3.0,
+    'pre_buffer': 5,         # <--- SURGICAL FIX: Added pre-buffer control
+    'auto_clear_secs': 4.0
+}
+
+CONFIDENCE_THRESH = 40.0
+
+IDLE = 'IDLE'
+SIGNING = 'SIGNING'
+EVALUATE = 'EVALUATE'
+
+MIN_SIGN_FRAMES = 8
+MAX_SIGN_FRAMES = 150
+END_TRIGGER = 15
+
+FEATURE_DIM = 198
+POSE_IDX = [11, 12, 13, 14, 15, 16]
+FACE_IDX = [1, 33, 61, 199, 263, 291]
+
+# Global State Machine Variables
+state = IDLE
+raw_rows = []
+rolling_buffer = deque(maxlen=CONFIG['pre_buffer']) # <--- SURGICAL FIX: Bound to 5 frames
+
+# Time trackers
+rec_start_time = None
+idle_start_time = time.time()
+no_hand_count = 0 # <--- SURGICAL FIX: Added missing global tracker
+
+gloss_buffer = []
+translated_text = ""
+last_prediction = ""
+last_confidence = 0.0
+
+# ── 2. Labels & Detectors ─────────────────────────────────────
+try:
+    labels_df = pd.read_csv(CONFIG['labels_csv'])
+    classnames = [labels_df[labels_df['id'] == i]['label'].values[0] for i in range(CONFIG['num_classes'])]
+    print(f'Loaded {len(classnames)} classes')
+except Exception as e:
+    print(f"❌ Could not load labels: {e}")
+    exit()
+
+_POSE = mp_vision.PoseLandmarker.create_from_options(
+    mp_vision.PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=CONFIG['pose_model']),
+        running_mode=mp_vision.RunningMode.IMAGE, num_poses=1,
+        min_pose_detection_confidence=0.4))
+
+_HAND = mp_vision.HandLandmarker.create_from_options(
+    mp_vision.HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=CONFIG['hand_model']),
+        running_mode=mp_vision.RunningMode.IMAGE, num_hands=2,
+        min_hand_detection_confidence=0.4))
+
+_FACE = mp_vision.FaceLandmarker.create_from_options(
+    mp_vision.FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=CONFIG['face_model']),
+        running_mode=mp_vision.RunningMode.IMAGE, num_faces=1,
+        min_face_detection_confidence=0.3))
+
+print('Detectors initialized ✅')
 
 
-@app.route('/', methods=['GET'])
-def home():
-    return render_template('index.html')
+# ── 3. Feature Pipeline (YOUR EXACT WORKING CODE) ─────────────
+def extract_frame_live(bgr_frame):
+    row = np.full(FEATURE_DIM, np.nan, dtype=np.float32)
+    row[144:180] = 0. 
+    rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+    img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-@app.route('/service_worker.js')
-def service_worker():
-    return send_from_directory(os.path.join(app.root_path, 'static'), 'service_worker.js')
+    pr = _POSE.detect(img)
+    hr = _HAND.detect(img)
+    fr = _FACE.detect(img)
 
-@app.route('/manifest.json')
-def manifest():
-    return app.send_static_file('manifest.json')
+    if pr.pose_landmarks:
+        lms = pr.pose_landmarks[0]
+        for k, joint_idx in enumerate(POSE_IDX):
+            row[k * 3: k * 3 + 3] = [lms[joint_idx].x, lms[joint_idx].y, lms[joint_idx].z]
 
-# @app.route('/service_worker.js')
-# def service_worker():
-#     return app.send_static_file('service_worker.js')
-
-# @app.route('/predict_video', methods=['POST'])
-# def predict_video():
-#     # 1. Get the file and check if it exists
-#     file = request.files.get('video')
-#     if not file:
-#         print("ERROR: No video file provided") # Print for server log
-#         return jsonify({'error': 'No video file provided'}), 400
-
-#     temp_path = None
-#     try:
-#         # 2. Use tempfile to create a temporary path and save the file
-#         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
-#             temp_path = tmp.name
-#             file.save(temp_path)
-
-#         # 3. OpenCV can now reliably open the file path
-#         cap = cv2.VideoCapture(temp_path)
-        
-#         # Check if the video opened successfully
-#         if not cap.isOpened():
-#             print(f"ERROR: Failed to open video at {temp_path}")
-#             return jsonify({'error': 'Could not open video file with OpenCV. It may be corrupt or an unsupported format.'}), 500
-
-#         predictions = []
-#         frame_count = 0
-        
-#         # 4. Processing loop remains the same
-#         # ... (Frame processing logic) ...
-#         while cap.isOpened() and frame_count < 30:
-#             ret, frame = cap.read()
-#             if not ret: break
-#             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-#             frame = cv2.resize(frame, (224, 224))
-#             frame = np.expand_dims(frame / 255.0, axis=0).astype(np.float32)
+    lc = np.full(63, np.nan, dtype=np.float32)
+    rc = np.full(63, np.nan, dtype=np.float32)
+    hand_ok = hr.hand_landmarks is not None and len(hr.hand_landmarks) > 0
+    if hand_ok:
+        for hl, hd in zip(hr.hand_landmarks, hr.handedness):
+            coords = np.array([[l.x, l.y, l.z] for l in hl], dtype=np.float32).flatten()
+            if hd[0].category_name == 'Left': lc = coords
+            else: rc = coords
             
-#             # --- Print prediction for debugging ---
-#             pred = model.predict(frame, verbose=0)
-#             class_index = np.argmax(pred)
-#             predictions.append(class_index)
-#             # print(f"Frame {frame_count+1}: Predicted Index {class_index}, Confidence: {pred[0][class_index]:.2f}") 
-#             # (Uncomment the line above for detailed frame-by-frame output)
-#             # -------------------------------------
-            
-#             frame_count += 1
-        
-#         cap.release()
-        
-#         if not predictions:
-#             # Handle case where video was empty or had 0 readable frames
-#             print("ERROR: Video contains no readable frames.")
-#             return jsonify({'error': 'Video contains no readable frames.'}), 400
-            
-#         final_index = max(set(predictions), key=predictions.count)
-#         final_label = CLASS_LABELS.get(final_index, 'Unknown Class') # Get the readable label
-        
-#         # --- Print the final result ---
-#         print(f"\n✅ SUCCESS: Final Prediction Index: {final_index} ({final_label})")
-#         print(f"Frames analyzed: {frame_count}\n")
-#         # ------------------------------
-        
-#         # 5. Return the index AND the label in the JSON response
-#         return jsonify({
-#             'prediction_index': int(final_index),
-#             'prediction_label': final_label,
-#             'frames_analyzed': frame_count
-#         })
+    row[18:81] = lc
+    row[81:144] = rc
+    
+    if fr.face_landmarks:
+        lms = fr.face_landmarks[0]
+        for k, idx in enumerate(FACE_IDX): 
+            row[180 + k * 3: 180 + k * 3 + 3] = [lms[idx].x, lms[idx].y, lms[idx].z]
 
-#     finally:
-#         # 6. Ensure the temporary file is deleted
-#         if temp_path and os.path.exists(temp_path):
-#             os.remove(temp_path)
+    return row, hr, pr, fr, hand_ok
+
+
+def raw_rows_to_skeleton(raw_rows):
+    # ── EXACT 0004 PREPROCESSING CLONE ──
+    seq = np.stack(raw_rows, axis=0).astype(np.float32)
+    
+    # 1. Force strict 48-frame timeline via resize
+    seq = cv2.resize(seq, (198, CONFIG['num_frames']), interpolation=cv2.INTER_LINEAR)
+
+    # 2. Impute & Low-Pass Filter (The Tremor Fix)
+    df  = pd.DataFrame(seq)
+    df  = df.interpolate(method='linear', axis=0).ffill().bfill().fillna(0.)
+    df  = df.rolling(window=3, min_periods=1, center=True).mean()
+    seq = df.values.astype(np.float32)
+    
+    # 3. Custom Spatial Normalization
+    lx, ly = seq[:, 0], seq[:, 1]; rx, ry = seq[:, 3], seq[:, 4]
+    midx, midy, midz = (lx + rx) / 2., (ly + ry) / 2., (seq[:, 2] + seq[:, 5]) / 2.
+    sw = np.sqrt((lx - rx) ** 2 + (ly - ry) ** 2).astype(np.float32) + 1e-6
+    
+    if not (np.isnan(sw).all() or (sw < 1e-5).all()):
+        for i in range(0, 18, 3): 
+            seq[:, i] = (seq[:, i] - midx) / sw; seq[:, i + 1] = (seq[:, i + 1] - midy) / sw; seq[:, i + 2] = (seq[:, i + 2] - midz) / sw
+        for start in [18, 81]:
+            wx, wy, wz = seq[:, start].copy(), seq[:, start + 1].copy(), seq[:, start + 2].copy()
+            hs = np.sqrt((wx - seq[:, start + 27]) ** 2 + (wy - seq[:, start + 28]) ** 2) + 1e-6
+            for i in range(start, start + 63, 3): 
+                seq[:, i] = (seq[:, i] - wx) / hs; seq[:, i + 1] = (seq[:, i + 1] - wy) / hs; seq[:, i + 2] = (seq[:, i + 2] - wz) / hs
+        for i in range(180, 198, 3): 
+            seq[:, i] = (seq[:, i] - midx) / sw; seq[:, i + 1] = (seq[:, i + 1] - midy) / sw; seq[:, i + 2] = (seq[:, i + 2] - midz) / sw
+            
+    seq = np.nan_to_num(seq, nan=0., posinf=0., neginf=0.)
+    
+    # 4. Kinematic Velocity
+    T = seq.shape[0]
+    pv, rv, lv = np.zeros((T, 18), dtype=np.float32), np.zeros((T, 9), dtype=np.float32), np.zeros((T, 9), dtype=np.float32)
+    pv[1:], rv[1:], lv[1:] = seq[1:, :18] - seq[:-1, :18], seq[1:, 81:90] - seq[:-1, 81:90], seq[1:, 18:27] - seq[:-1, 18:27]
+    pv[0], rv[0], lv[0] = pv[1], rv[1], lv[1]
+    seq[:, 144:162], seq[:, 162:171], seq[:, 171:180] = pv, rv, lv
+    
+    return seq
+
+
+# ── 4. PyTorch Model ──────────────────────────────────────────
+class FSLTransformer(nn.Module):
+    def __init__(self, feature_dim=198, d_model=384, nhead=8, num_layers=6, dim_ff=768, dropout=0.25, num_classes=105, seq_len=48):
+        super().__init__()
+        xp = (list(range(0, 18, 3)) + list(range(18, 81, 3)) + list(range(81, 144, 3)) + list(range(144, 180, 3)) + list(range(180, 198, 3)))
+        yp = (list(range(1, 18, 3)) + list(range(19, 81, 3)) + list(range(82, 144, 3)) + list(range(145, 180, 3)) + list(range(181, 198, 3)))
+        self.register_buffer('x_idx', torch.tensor(xp, dtype=torch.long))
+        self.register_buffer('y_idx', torch.tensor(yp, dtype=torch.long))
+        self.x_proj = nn.Linear(len(xp), d_model)
+        self.y_proj = nn.Linear(len(yp), d_model)
+        self.x_pos = nn.Embedding(seq_len, d_model)
+        self.y_pos = nn.Embedding(seq_len, d_model)
+        self.x_norm = nn.LayerNorm(d_model)
+        self.y_norm = nn.LayerNorm(d_model)
+
+        def enc():
+            return nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_ff, dropout=dropout, batch_first=True, activation='gelu', norm_first=True),
+                num_layers=num_layers, enable_nested_tensor=False)
+
+        self.x_enc = enc()
+        self.y_enc = enc()
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.pool_norm = nn.LayerNorm(d_model * 2)
+        
+        self.proj_head = nn.Sequential(nn.Linear(d_model * 2, d_model), nn.ReLU(), nn.Linear(d_model, 128))
+                                       
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model * 2, d_model), nn.GELU(), nn.Dropout(0.35),
+            nn.Linear(d_model, d_model // 2), nn.GELU(), nn.Dropout(0.15),
+            nn.Linear(d_model // 2, num_classes))
+
+    def encode(self, x):
+        B, T, _ = x.shape
+        pos = torch.arange(T, device=x.device)
+        xe = self.x_norm(self.x_proj(x[:, :, self.x_idx]) + self.x_pos(pos))
+        ye = self.y_norm(self.y_proj(x[:, :, self.y_idx]) + self.y_pos(pos))
+        xe = self.x_enc(xe)
+        ye = self.y_enc(ye)
+        fused, _ = self.cross_attn(query=xe, key=ye, value=ye)
+        return self.pool_norm(torch.cat([fused, xe], dim=-1).mean(dim=1))
+
+    def forward(self, x):
+        return self.classifier(self.encode(x))
+
+try:
+    model = FSLTransformer(feature_dim=CONFIG['feature_dim'], d_model=CONFIG['d_model'], nhead=CONFIG['nhead'], num_layers=CONFIG['num_layers'], dim_ff=CONFIG['dim_ff'], dropout=CONFIG['dropout'], num_classes=CONFIG['num_classes'], seq_len=CONFIG['num_frames']).to(device)
+    model.load_state_dict(torch.load(CONFIG['model_path'], map_location=device), strict=False)
+    model.eval()
+    print(f'Model loaded from {CONFIG["model_path"]} ✅  device={device}')
+except Exception as e:
+    print(f"❌ CRITICAL: Could not load PyTorch model: {e}")
+    exit()
+
+# EXACT 0004 INFERENCE (No TTA Noise)
+def predict_sign(seq):
+    tensor = torch.from_numpy(seq).float().unsqueeze(0).to(device)
+    with torch.no_grad():
+        probs = torch.softmax(model(tensor), dim=1)[0].cpu().numpy()
+    top_idx = probs.argsort()[::-1][:CONFIG['top_k']]
+    return [(classnames[i], float(probs[i]) * 100) for i in top_idx]
+
+# ── 5. API Routes ─────────────────────────────────────────────
+def decode_base64_image(b64_str):
+    if ',' in b64_str:
+        b64_str = b64_str.split(',')[1]
+    img_data = base64.b64decode(b64_str)
+    nparr = np.frombuffer(img_data, np.uint8)
+    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    global state, raw_rows, rolling_buffer
+    global rec_start_time, idle_start_time, no_hand_count 
+    global gloss_buffer, translated_text, last_prediction, last_confidence
+
+    now = time.time()
+
+    try:
+        data = request.json
+        if not data or 'image' not in data:
+            return jsonify({"error": "Missing 'image' key with Base64 payload."}), 400
+
+        frame = decode_base64_image(data['image'])
+        
+        raw_row, hr, pr, fr, hand_ok = extract_frame_live(frame)
+
+        # ── Extract Lightweight Drawing Coordinates ──
+        draw_points = []
+        if pr.pose_landmarks:
+            lms = pr.pose_landmarks[0]
+            for idx in POSE_IDX: draw_points.append({'x': lms[idx].x, 'y': lms[idx].y, 'type': 'pose'})
+        if hr.hand_landmarks:
+            for idx, lms in enumerate(hr.hand_landmarks):
+                side = hr.handedness[idx][0].category_name if idx < len(hr.handedness) else 'Right'
+                for lm in lms: draw_points.append({'x': lm.x, 'y': lm.y, 'type': side})
+        if fr.face_landmarks:
+            lms = fr.face_landmarks[0]
+            for idx in FACE_IDX: draw_points.append({'x': lms[idx].x, 'y': lms[idx].y, 'type': 'face'})
+
+        # ── State Machine Logic ─────────────────────
+        if state == IDLE:
+            rolling_buffer.append(raw_row)
+            if hand_ok:
+                raw_rows = list(rolling_buffer)
+                rec_start_time = now
+                no_hand_count = 0 
+                state = SIGNING
+                print('Auto-Triggered! Recording for 3s...')
+            else:
+                if len(gloss_buffer) > 0 and (now - idle_start_time) >= CONFIG['auto_clear_secs']:
+                    gloss_buffer.clear()
+                    translated_text = ""
+                    print("\n[Auto-Cleared] 4 seconds of inactivity.")
+                    idle_start_time = now
+                    
+                    
+
+        elif state == SIGNING:
+            raw_rows.append(raw_row)
+            
+            if hand_ok:
+                no_hand_count = 0
+            else:
+                no_hand_count += 1
+                
+            # Early exit & Trailing crop trigger
+            if (now - rec_start_time) >= CONFIG['record_secs'] or no_hand_count >= END_TRIGGER:
+                trim_n = min(no_hand_count, len(raw_rows) - 8)
+                if trim_n > 0:
+                    raw_rows = raw_rows[:-trim_n]
+                
+                state = EVALUATE
+
+        # ── Evaluation Block ────────────────────────────────────
+        if state == EVALUATE:
+            # FIX: We pass the raw_rows directly into your exact processing function!
+            # We DO NOT use np.linspace here anymore, because cv2.resize handles it inside raw_rows_to_skeleton!
+            seq = raw_rows_to_skeleton(raw_rows)
+            
+            display_top5 = predict_sign(seq)
+            lbl, conf = display_top5[0]
+
+            last_prediction = lbl
+            last_confidence = conf
+
+            if conf >= CONFIDENCE_THRESH:
+                gloss_buffer.append(lbl.lower().replace(" ", "_"))
+                gloss_string = " ".join(gloss_buffer)
+                translated_text = glosstosentenceinference(gloss_string)
+                print(f"✅ Translated: '{translated_text}'")
+
+            raw_rows = []
+            rolling_buffer.clear()
+            idle_start_time = now  
+            state = IDLE
+
+        top_3_list = []
+        # Check if we have predictions to show
+        if 'display_top5' in locals():
+            for lbl, conf in display_top5[:3]:
+                top_3_list.append({
+                    "label": lbl.upper(),
+                    "conf": float(conf)
+                })
+        # ---------------------
+
+        return jsonify({
+            "status": "success",
+            "state": state,
+            "top_3": top_3_list,  # <--- Include this in the return
+            "new_sign": last_prediction if last_confidence >= CONFIDENCE_THRESH else "...",
+            "history": " ".join(gloss_buffer).replace("_", " "),
+            "sentence": translated_text if translated_text else "...",
+            "confidence": last_confidence,
+            "landmarks": draw_points
+        })
+
+    except Exception as e:
+        print(f"❌ ERROR: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/reset', methods=['POST'])
+def reset():
+    global state, raw_rows, rolling_buffer
+    global rec_start_time, idle_start_time, no_hand_count 
+    global gloss_buffer, translated_text, last_prediction, last_confidence
+
+    state = IDLE
+    raw_rows = []
+    rolling_buffer.clear()
+    no_hand_count = 0
+    gloss_buffer.clear()
+    translated_text = ""
+    last_prediction = ""
+    last_confidence = 0.0
+    idle_start_time = time.time()
+
+    print("🔄 STATE CLEARED")
+    return jsonify({"status": "cleared"})
 
 if __name__ == '__main__':
-    app.run(port=8200, debug=True)
+    app.run(port=5000, debug=True)
