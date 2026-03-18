@@ -1,139 +1,132 @@
-// NON HERE DONT MIND IDK
+// 1. SETUP DOM ELEMENTS
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
 
-// // --- Configuration ---
-// const VIDEO_FPS = 5; // Send 5 frames per second (predict every 200ms)
-// let predictionInterval = null;
+const liveBox = document.getElementById('liveBox');       // Shows "Seeing: Monday" commented out the html 
+const sentenceBox = document.getElementById('sentenceBox'); // Shows "Sentence: Monday Tuesday"
 
-// // --- DOM Elements ---
-// const video = document.getElementById('videoElement');
-// const errorMessage = document.getElementById('errorMessage');
-// // We are using your existing #subtitleBox as the prediction output
-// const resultElement = document.getElementById('subtitleBox'); 
-// const canvas = document.getElementById('canvasElement'); // The hidden canvas
+// Create a hidden canvas specifically for downscaling and compressing the image
+const hiddenCanvas = document.createElement('canvas');
+const hiddenCtx = hiddenCanvas.getContext('2d');
+hiddenCanvas.width = 640;  // Lock resolution to keep payloads tiny
+hiddenCanvas.height = 480;
 
-// // --- Prediction Logic ---
+// TRAFFIC CONTROL: Prevents network lag and maintains local FPS
+let isProcessing = false;
+let previousHistory = "";
 
-// /**
-//  * Sends the captured frame to the Flask server for prediction.
-//  * @param {Blob} imageBlob The captured image data (Blob object).
-//  */
-// async function sendFrameToFlask(imageBlob) {
-//     // -------------------------------------------------------------------
-//     // This is the actual Fetch/AJAX code to communicate with Flask.
-//     // Ensure your Flask server has the /predict_frame route set up.
-//     // -------------------------------------------------------------------
+// 2. THE MAIN LOOP (Replaces MediaPipe onResults)
+async function processVideoFrame() {
+    // Only process if the camera is ready and the server is NOT busy
+    if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA && !isProcessing) {
+        isProcessing = true; // 🔴 LOCK (Stop other frames from piling up)
 
-//     const endpoint = '/predict_frame'; 
-//     const formData = new FormData();
-//     // 'image' must match the key in Flask: request.files.get('image')
-//     formData.append('image', imageBlob, 'frame.jpeg'); 
+        // A. Downscale and Compress
+        // Draw the current video frame to our hidden canvas
+        hiddenCtx.drawImage(videoElement, 0, 0, hiddenCanvas.width, hiddenCanvas.height);
+        // Compress to JPEG at 50% quality for massive speedup
+        const base64Image = hiddenCanvas.toDataURL('image/jpeg', 0.5); 
 
-//     try {
-//         const response = await fetch(endpoint, {
-//             method: 'POST',
-//             body: formData
-//         });
+        // B. Send to Flask Backend
+        try {
+            const response = await fetch('http://127.0.0.1:5000/predict', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image: base64Image })
+            });
+            
+            const data = await response.json();
 
-//         const result = await response.json();
+        // 1. UPDATE THE TOP 3 PREDICTIONS (The code from your screenshot)
+        if (data.top_3) {
+            data.top_3.forEach((item, index) => {
+                const rank = index + 1;
+                const wordEl = document.getElementById(`word-${rank}`);
+                const confEl = document.getElementById(`conf-${rank}`);
 
-//         if (response.ok) {
-//             // SUCCESS: Update the subtitle box with the live prediction
-//             if (result.prediction_label) {
-//                 resultElement.textContent = result.prediction_label;
-//             }
-//         } else {
-//             // ERROR: Show the error in the subtitle box or console
-//             resultElement.textContent = `Error: ${result.error || 'Server processing failed'}`;
-//             console.error('Prediction Error:', result.error);
-//         }
-//     } catch (error) {
-//         // Network failure (server not running or connection lost)
-//         // resultElement.textContent = 'Connection error.'; // Uncomment if you want to show connection errors
-//         console.error('Network or Fetch Error:', error);
-//     }
-// }
+                if (wordEl && confEl) {
+                    wordEl.innerText = item.label;
+                    confEl.innerText = item.conf.toFixed(1) + "%";
+                    wordEl.style.color = (rank === 1) ? "#00FF00" : "#888";
+                    confEl.style.color = (rank === 1) ? "#00FF00" : "#888";
+                }
+            });
+        }
 
+        // 2. UPDATE THE STATUS LABEL (Place this right here)
+        const statusLabel = document.getElementById('status-label');
+        statusLabel.innerText = data.state;
 
-// /**
-//  * Sets up the timer to continuously grab frames from the video element.
-//  */
-// function startContinuousPrediction() {
-//     const context = canvas.getContext('2d');
-//     const FRAME_SIZE = 224; // Must match your model's input size (224, 224)
-    
-//     // Set canvas dimensions
-//     canvas.width = FRAME_SIZE;
-//     canvas.height = FRAME_SIZE;
+        // Change color based on the state for visual feedback
+        if (data.state === 'SIGNING') {
+            statusLabel.style.color = "#ff4444"; // Red
+        } else if (data.state === 'EVALUATE') {
+            statusLabel.style.color = "#ffbb00"; // Orange
+        } else {
+            statusLabel.style.color = "#00FF00"; // Green
+        }
 
-//     // Clear any existing loop
-//     if (predictionInterval) {
-//         clearInterval(predictionInterval);
-//     }
+        // 3. UPDATE FPS (Performance metric)
+        const now = Date.now();
+        const fps = Math.round(1000 / (now - (window.lastTime || now)));
+        window.lastTime = now;
+        document.getElementById('fps-display').innerText = `${fps} FPS`
 
-//     predictionInterval = setInterval(() => {
-//         // 1. Draw the current video frame onto the canvas
-//         // This captures the frame and scales/crops it to 224x224.
-//         context.drawImage(video, 0, 0, FRAME_SIZE, FRAME_SIZE);
+            // --- 1. LIVE PREDICTION (Yellow) ---
+            if (data.new_sign && data.new_sign !== "...") {
+                liveBox.innerText = "Input: " + data.new_sign;
+                liveBox.style.color = "yellow";
+            } else {
+                liveBox.innerText = "...";
+                liveBox.style.color = "gray";
+            }
 
-//         // 2. Convert the canvas content (the frame) to an image Blob
-//         canvas.toBlob((blob) => {
-//             if (blob) {
-//                 sendFrameToFlask(blob);
-//             }
-//         }, 'image/jpeg', 0.8); // Use JPEG for smaller file size
-        
-//     }, 1000 / VIDEO_FPS); // Run every 200 milliseconds (5 FPS)
-    
-//     console.log(`[JS] Continuous prediction loop started at ${VIDEO_FPS} FPS.`);
-// }
-
-
-// // --- Initialization (Your original window.onload function) ---
-
-// window.onload = function() {
-//     // Initial message for the subtitle box
-//     resultElement.textContent = 'Waiting for camera access...';
-
-//     // Checks if the browser supports getUserMedia
-//     if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-//         const constraints = { video: true };
-
-//         // Request access to the user's camera
-//         navigator.mediaDevices.getUserMedia(constraints)
-//             .then((stream) => {
-//                 // Success: connect the camera
-//                 video.srcObject = stream;
-//                 video.style.display = 'block'; // Make video visible
-//                 errorMessage.style.display = 'none';
-//                 resultElement.textContent = 'Camera active. Analyzing signs...';
-
-//                 // 🔥 NEW INTEGRATION POINT 🔥
-//                 // Start prediction loop after the video metadata is loaded and played
-//                 video.onloadedmetadata = () => {
-//                     video.play();
-//                     startContinuousPrediction();
-//                 };
-//             })
-//             .catch((err) => {
-//                 // Failure: display error message
-//                 console.error('An error occurred: ' + err);
-//                 video.style.display = 'none';
-//                 errorMessage.style.display = 'block';
-//                 resultElement.textContent = 'CAMERA ERROR.';
+            // --- 2. VALIDATION & FINAL SENTENCE (Green Flash) ---
+            if (data.history !== previousHistory) {
+                if (data.sentence && data.sentence !== "..." && data.sentence !== "") {
+                    sentenceBox.innerText = data.sentence;
+                } else {
+                    sentenceBox.innerText = data.history; 
+                }
                 
-//                 if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-//                     errorMessage.textContent = 'Camera access was denied. Please allow camera access.';
-//                 } else if (err.name === 'NotFoundError') {
-//                     errorMessage.textContent = 'No camera found on this device.';
-//                 } else {
-//                     errorMessage.textContent = 'An error occurred while accessing the camera.';
-//                 }
-//             });
-//     } else {
-//         // If getUserMedia is not supported
-//         video.style.display = 'none';
-//         errorMessage.style.display = 'block';
-//         errorMessage.textContent = 'Your browser does not support camera access.';
-//         resultElement.textContent = 'Browser not supported.';
-//     }
-// };
+                previousHistory = data.history;
+                
+                // Visual Flash Effect
+                sentenceBox.style.backgroundColor = "#000000"; 
+                setTimeout(() => { sentenceBox.style.backgroundColor = "black"; }, 500);
+            }
+        } catch (err) {
+            console.error("Server error or timeout:", err);
+        } finally {
+            isProcessing = false; // 🟢 UNLOCK (Next frame allowed)
+        }
+    }
+
+    // C. Draw Visual Feedback for the User
+    // Mirror the video to the visible canvas so the user can see themselves
+    if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.restore();
+    }
+
+    // Loop continuously before the next browser repaint
+    requestAnimationFrame(processVideoFrame);
+}
+
+
+
+// 3. START CAMERA (Standard HTML5 WebRTC)
+navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
+    .then(stream => {
+        videoElement.srcObject = stream;
+        videoElement.play();
+        // Start the loop once the camera is live
+        requestAnimationFrame(processVideoFrame);
+    })
+    .catch(err => {
+        console.error("Camera access denied!", err);
+        alert("Please allow camera access to use the translator.");
+    });
